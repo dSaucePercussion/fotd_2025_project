@@ -2,61 +2,51 @@
 #define SPEAKER_PIN WIO_BUZZER
 
 #include "TFT_eSPI.h"
-#include "Seeed_FS.h"  // SD card library
-#include "RawImage.h"   // Image processing library
+#include "Seeed_FS.h"
+#include "RawImage.h"
 #include "pitches.h"
 
 TFT_eSPI tft;
 
-// --- Music Playback State ---
-bool isPlayingSong = false;
-int songNoteIndex = 0;
-unsigned long songNoteStart = 0;
+// --- FSM States ---
+enum State {
+  WAIT_FOR_BUTTON,
+  IDLE,
+  PLAYING,
+  SAURON,
+  COOLDOWN,
+  SAMWISE
+};
+State currentState = WAIT_FOR_BUTTON;
+
+// --- Flags and Control ---
 bool notePlaying = false;
-int lastFrameShown = -1;
-
-// --- Animation Playback State ---
-const int totalFrames = 4;
-int currentFrame = 0;
-unsigned long lastFrameTime = 0;
-const int frameInterval = 2000; // 1000ms = 1 FPS
-
-// --- Sauron timing --
-int searchingState = false;
-unsigned long timeSinceMotionDetected = 0;
-unsigned long timeMotionIsDetected = 0;
-unsigned long searchingTime = 0;
-unsigned long nextCheck = 0;
-unsigned long sauronThreshold = 0;
-unsigned long randomDelay = 0;
-bool inSauronMode = false;
-unsigned long sauronStartTime = 0;
-const unsigned long sauronDuration = 5000; // 5 seconds
+bool frameNeedsUpdate = false;
 bool sauronWasTriggered = false;
 
-bool systemArmed = false; // True after button press
+// --- Indices and Timing ---
+int songNoteIndex = 0;
+int currentFrame = 0;
+int lastFrameShown = -1;
+int frameToShow = -1;
+unsigned long songNoteStart = 0;
+unsigned long lastFrameRenderTime = 0;
+unsigned long sauronStartTime = 0;
+unsigned long cooldownStartTime = 0;
 
+// --- Sauron Tracking ---
+bool searchingState = false;
+unsigned long timeMotionIsDetected = 0;
+unsigned long nextCheck = 0;
+unsigned long randomDelay = 0;
+const unsigned long sauronDuration = 5000;
+const unsigned long cooldownDuration = 7000;
 
+// --- Constants ---
+const int totalFrames = 4;
+int halfNoteCH = 1154, quarterNoteCH = 577, eighthNoteCH = 288;
+int sixteenthNoteCH = 144, dotQuarterCH = 865;
 
-void playTrembleEffectNonBlocking(int baseFreq, int variation, int duration) {
-  static unsigned long lastToggle = 0;
-  static bool toggleState = false;
-
-  if (millis() - lastToggle >= 50) {
-    toggleState = !toggleState;
-    tone(SPEAKER_PIN, toggleState ? baseFreq + variation : baseFreq - variation);
-    lastToggle = millis();
-  }
-}
-
-// Define note durations based on correct tempo for concerning hobbits
-int halfNoteCH = 1154;
-int quarterNoteCH = 577;
-int eighthNoteCH = 288;
-int sixteenthNoteCH = 144;
-int dotQuarterCH = 865;
-
-// Corresponding note durations: 4 = quarter note, 8 = eighth note, etc.
 int noteDurationsCH[] = {
   sixteenthNoteCH, sixteenthNoteCH, quarterNoteCH, quarterNoteCH,
   quarterNoteCH, sixteenthNoteCH, sixteenthNoteCH, sixteenthNoteCH,
@@ -73,212 +63,215 @@ int melodyCH[] = {
   NOTE_G4, NOTE_FS4, NOTE_E4
 };
 
-// 4 image frames: 1, 2, 3, and 4 at specific note indexes
 int frameSchedule[] = {
-  0, -1, -1, -1,   
-  1, -1, -1, -1,   // frame 2 at note 4
-  2, -1, -1, -1,   // frame 3 at note 8
-  3, -1, -1, -1,   // frame 4 at note 12
-  -1, -1, -1       // no new frames after that
+  0, -1, -1, -1,
+  1, -1, -1, -1,
+  2, -1, -1, -1,
+  3, -1, -1, -1,
+  -1, -1, -1
 };
 
 void setup() {
-    Serial.begin(115200);
+  Serial.begin(115200);
+  if (!SD.begin(SDCARD_SS_PIN, SDCARD_SPI)) {
+    Serial.println("SD Card Initialization Failed!");
+    while (1);
+  }
+  tft.begin();
+  tft.setRotation(1); // Rotate 180 degrees (3 upside-down -> 1)
+  pinMode(PIR_MOTION_SENSOR, INPUT);
+  pinMode(13, OUTPUT);
+  pinMode(WIO_5S_PRESS, INPUT_PULLUP);
+  randomSeed(analogRead(A2));
 
-    // Initialize SD card
-    if (!SD.begin(SDCARD_SS_PIN, SDCARD_SPI)) {
-        Serial.println("SD Card Initialization Failed!");
-        while (1);
-    }
-
-    tft.begin();
-    tft.setRotation(3);
-    pinMode(PIR_MOTION_SENSOR, INPUT);
-    pinMode(13, OUTPUT);  // LED for motion debug
-    pinMode(WIO_5S_PRESS, INPUT_PULLUP);
-
-    randomSeed(analogRead(A2));
-
-    tft.fillScreen(TFT_BLACK);
-    tft.setTextColor(TFT_WHITE, TFT_BLACK);
-    tft.setTextSize(2);
-    tft.setCursor(20, 100);
-    tft.println("Press the blue button");
-    tft.setCursor(20, 130);
-    tft.println("to begin your CTP");
-    tft.setCursor(20, 160);
-    tft.println("adventure!");
-
-    while (digitalRead(WIO_5S_PRESS) == HIGH); // Wait for button press
-    delay(500);  // Debounce
-    systemArmed = true;
-
-    tft.fillScreen(TFT_BLACK);
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setTextSize(2);
+  tft.setCursor(20, 80);
+  tft.println("Press the blue circle");
+  tft.setCursor(20, 110);
+  tft.println("to begin your CTP");
+  tft.setCursor(20, 140);
+  tft.println("adventure!");
 }
 
 void loop() {
   int motionState = digitalRead(PIR_MOTION_SENSOR);
-  Serial.println(motionState);
-  digitalWrite(13, motionState); // LED debug
-
-  if (!systemArmed) return;
-
-  if (inSauronMode) {
-    playTrembleEffectNonBlocking(440, 30, sauronDuration);
-
-    if (millis() - sauronStartTime >= sauronDuration) {
-      inSauronMode = false;
-      sauronWasTriggered = false;
-      Serial.println("Sauron gone. Back to idle.");
-      noTone(SPEAKER_PIN);
-    }
-
-    return; // skip rest of loop while in Sauron mode
-  }
-
-  // If motion is still active after Sauron mode ends, restart everything
-  if (!inSauronMode && sauronWasTriggered && motionState && !isPlayingSong) {
-    Serial.println("Motion still detected after Sauron — restarting song.");
-    isPlayingSong = true;
-    songNoteIndex = 0;
-    notePlaying = false;
-    currentFrame = 0;
-    lastFrameTime = millis();
-
-    // Re-arm the Sauron search timer
-    searchingState = true;
-    timeSinceMotionDetected = 0;
-    timeMotionIsDetected = millis();
-    searchingTime = millis();
-    nextCheck = searchingTime + 500;
-    randomDelay = random(10000, 15001);
-    sauronThreshold = millis() + randomDelay;
-  }
-
+  digitalWrite(13, motionState);
   unsigned long now = millis();
 
-  // Trigger playback once when motion is detected
-  if (motionState && !isPlayingSong) {
-    Serial.println("Motion detected! Starting animation + music...");
-    isPlayingSong = true;
-    songNoteIndex = 0;
-    notePlaying = false;
-    currentFrame = 1;
-    lastFrameTime = now;
-    searchingState = true;
-    timeSinceMotionDetected = 0;
-    timeMotionIsDetected = millis();
-    searchingTime = millis();
-    nextCheck = searchingTime + 500;
-    randomDelay = random(10000, 15001);
-    sauronThreshold = millis() + randomDelay;
-    Serial.print(sauronThreshold);
-  }
+  Serial.println(currentState);
 
-    // --- SAURON TRACKING ---
-  searchingTime = millis();
-  if (searchingState && !inSauronMode && now > nextCheck) {
-    if (!motionState) {
-      // Cancel Sauron tracking if motion stops
-      searchingState = false;
-      sauronWasTriggered = false;
-      Serial.println("Motion stopped — Sauron tracking cancelled.");
-      return;
-    }
+  switch (currentState) {
+    case WAIT_FOR_BUTTON:
+      if (digitalRead(WIO_5S_PRESS) == LOW) {
+        delay(300);
+        currentState = IDLE;
+        tft.fillScreen(TFT_BLACK);
+        Serial.println("System Armed");
+      }
+      break;
 
-    timeSinceMotionDetected = now - timeMotionIsDetected;
-    Serial.print("Time since motion started: ");
-    Serial.println(timeSinceMotionDetected);
-    nextCheck += 500;
-
-    if (timeSinceMotionDetected > randomDelay) {
-    Serial.println("Aughhhh Sauron found you!!");
-
-    // Try drawing image FIRST
-    String sauronImage = "sauron/eyeOfSauron.bmp";
-    File f = SD.open(sauronImage.c_str());
-    if (f) {
-      f.close();
-      Serial.println("Sauron image found, rendering...");
-      drawImage<uint16_t>(sauronImage.c_str(), 0, 0);
-    } else {
-      Serial.println("ERROR: Sauron image not found on SD card!");
-    }
-
-    // Then enter Sauron mode
-    inSauronMode = true;
-    sauronWasTriggered = true;
-    sauronStartTime = now;
-
-    noTone(SPEAKER_PIN);
-    isPlayingSong = false;
-    notePlaying = false;
-    songNoteIndex = 0;
-    searchingState = false;
-
-    }
-  }
-
-
-  // --- MUSIC PLAYBACK ---
-  if (isPlayingSong && songNoteIndex < sizeof(melodyCH)/sizeof(melodyCH[0]) && !inSauronMode) {
-    if (!notePlaying) {
-      tone(SPEAKER_PIN, melodyCH[songNoteIndex], noteDurationsCH[songNoteIndex]);
-      songNoteStart = now;
-      notePlaying = true;
-      Serial.print("Playing note ");
-      Serial.println(songNoteIndex);
-    }
-
-    if (notePlaying && now - songNoteStart >= noteDurationsCH[songNoteIndex]) {
-      noTone(SPEAKER_PIN);
-      songNoteIndex++;
-      notePlaying = false;
-
-      // End of song
-      if (songNoteIndex >= sizeof(melodyCH)/sizeof(melodyCH[0])) {
-        Serial.println("Song finished.");
+    case IDLE:
+      if (motionState) {
         songNoteIndex = 0;
         notePlaying = false;
         currentFrame = 0;
-        lastFrameTime = millis();
+        frameNeedsUpdate = false;
+        searchingState = true;
+        timeMotionIsDetected = now;
+        nextCheck = now + 500;
+        randomDelay = random(5000, 10001);
+        currentState = PLAYING;
+        Serial.println("Motion detected — starting song");
+      } else {
+        drawImageSafe("shire/theShire00.bmp");
+        delay(500);
+      }
+      break;
 
-        if (motionState && !sauronWasTriggered) {
-          Serial.println("Looping song due to sustained motion.");
-          // keep playing!
-        } else {
-          Serial.println("No more motion — pausing song.");
-          isPlayingSong = false;
+    case PLAYING:
+      if (searchingState && now > nextCheck) {
+        if (!motionState) {
+          searchingState = false;
+          sauronWasTriggered = false;
+        } else if (now - timeMotionIsDetected > randomDelay) {
+          drawImageSafe("sauron/sauron0.bmp");
+          sauronWasTriggered = true;
+          sauronStartTime = now;
+          noTone(SPEAKER_PIN);
+          notePlaying = false;
+          songNoteIndex = 0;
+          searchingState = false;
+          currentState = SAURON;
+          break;
+        }
+        nextCheck = now + 500;
+      }
+
+      if (!notePlaying) {
+        tone(SPEAKER_PIN, melodyCH[songNoteIndex], noteDurationsCH[songNoteIndex]);
+        delay(10);
+        songNoteStart = now;
+        notePlaying = true;
+        int idx = frameSchedule[songNoteIndex] + 1; //offset to not re-display first image
+        if (idx != -1 && idx != lastFrameShown) {
+          frameToShow = idx;
+          frameNeedsUpdate = true;
         }
       }
-    }
-  }
+      if (notePlaying && now - songNoteStart >= noteDurationsCH[songNoteIndex]) {
+        noTone(SPEAKER_PIN);
+        songNoteIndex++;
+        notePlaying = false;
 
-  // --- ANIMATION LOOPING ---
-  if (isPlayingSong && now - lastFrameTime >= frameInterval && !inSauronMode) {
-    lastFrameTime = now;
+        if (songNoteIndex >= sizeof(melodyCH)/sizeof(melodyCH[0])) {
+          if (!motionState || sauronWasTriggered) {
+            currentState = IDLE;
+          } else {
+            songNoteIndex = 0;
+            currentFrame = 0;
+          }
+        }
+      }
+      // if (frameNeedsUpdate && now != lastFrameRenderTime) {
+      //   String filename = "shire/theShire" + formatFrameNumber(frameToShow) + ".bmp";
+      //   // drawImageSafe(filename);
+      //   lastFrameShown = frameToShow;
+      //   frameNeedsUpdate = false;
+      //   lastFrameRenderTime = now;
+      // }
+      break;
 
-    String filename = "shire/theShire" + formatFrameNumber(currentFrame) + ".bmp";
-    Serial.println("Displaying frame: " + filename);
-    drawImage<uint16_t>(filename.c_str(), 0, 0);
-    delay(10);
+    case SAURON:
+      playTrembleEffectNonBlocking(440, 30);
+      if (now - sauronStartTime >= sauronDuration) {
+        sauronWasTriggered = false;
+        cooldownStartTime = now;
+        currentState = COOLDOWN;
+        noTone(SPEAKER_PIN);
+        Serial.println("Sauron done. Entering cooldown...");
 
-    currentFrame++;
-    if (currentFrame > totalFrames) {
-      currentFrame = 0; // loop the animation
-    }
-  }
+        // Show cooldown screen (rotated display)
+        tft.fillScreen(TFT_BLACK);
+        tft.setTextColor(TFT_RED, TFT_BLACK);
+        tft.setTextSize(2);
+        tft.setCursor(10, 70);
+        tft.println("Sauron has found you!");
+        tft.setCursor(10, 100);
+        tft.println("Choose your Samwise and");
+        tft.setCursor(10, 130);
+        tft.println("press the blue circle to");
+        tft.setCursor(10, 160);
+        tft.println("continue the CTP journey.");
+      }
+      break;
 
-  // --- IDLE STATE ---
-  if (!isPlayingSong && !inSauronMode && !motionState) {
-    drawImage<uint16_t>("shire/theShire00.bmp", 0, 0);
-    delay(500);
+    case COOLDOWN:
+      if (digitalRead(WIO_5S_PRESS) == LOW) {
+        delay(300);
+        currentState = SAMWISE;
+        // tft.fillScreen(TFT_BLACK);
+        drawImageSafe("shire/theShire01.bmp");
+        delay(500);
+        Serial.println("Cooldown acknowledged. Returning to IDLE.");
+      }
+      break;
+
+    case SAMWISE:
+      if (!notePlaying) {
+        tone(SPEAKER_PIN, melodyCH[songNoteIndex], noteDurationsCH[songNoteIndex]);
+        delay(10);
+        songNoteStart = now;
+        notePlaying = true;
+      }
+      if (notePlaying && now - songNoteStart >= noteDurationsCH[songNoteIndex]) {
+        noTone(SPEAKER_PIN);
+        songNoteIndex++;
+        notePlaying = false;
+
+        if (songNoteIndex >= sizeof(melodyCH)/sizeof(melodyCH[0])) {
+          currentState = WAIT_FOR_BUTTON;
+          songNoteIndex = 0;
+            tft.fillScreen(TFT_BLACK);
+            tft.setTextColor(TFT_WHITE, TFT_BLACK);
+            tft.setTextSize(2);
+            tft.setCursor(20, 80);
+            tft.println("Press the blue circle");
+            tft.setCursor(20, 110);
+            tft.println("to begin your CTP");
+            tft.setCursor(20, 140);
+            tft.println("adventure!");
+        }
+      }
+      break;
+
   }
 }
 
-// Formats the frame number into "0001", "0002", etc.
+void drawImageSafe(String filename) {
+  File f = SD.open(filename.c_str());
+  if (f) {
+    f.close();
+    Serial.println("Displaying: " + filename);
+    drawImage<uint16_t>(filename.c_str(), 0, 0);
+  } else {
+    Serial.println("ERROR: Missing image: " + filename);
+  }
+}
+
+void playTrembleEffectNonBlocking(int baseFreq, int variation) {
+  static unsigned long lastToggle = 0;
+  static bool toggleState = false;
+  if (millis() - lastToggle >= 50) {
+    toggleState = !toggleState;
+    tone(SPEAKER_PIN, toggleState ? baseFreq + variation : baseFreq - variation);
+    lastToggle = millis();
+  }
+}
+
 String formatFrameNumber(int num) {
-    char buffer[5];  // Buffer to store formatted number
-    sprintf(buffer, "%02d", num);
-    return String(buffer);
+  char buffer[5];
+  sprintf(buffer, "%02d", num);
+  return String(buffer);
 }
